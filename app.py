@@ -11,8 +11,7 @@ app = Flask(__name__)
 # 0. CARGA DE CONFIGURACIÓN (.ENV)
 # ==============================================================================
 
-# 1. SEGURIDAD: ¿Quién puede entrar aquí? (Tokens para Deku)
-# Ejemplo: {"juan123": "Celular_Juan", "pepe456": "Celular_Pepe"}
+# 1. SEGURIDAD: Tokens autorizados
 try:
     auth_env = os.environ.get("AUTHORIZED_TOKENS", "{}")
     VALID_TOKENS = json.loads(auth_env)
@@ -20,15 +19,16 @@ except json.JSONDecodeError:
     print("⚠️ Error: AUTHORIZED_TOKENS mal formado. Acceso bloqueado.")
     VALID_TOKENS = {}
 
-# 2. ENRUTAMIENTO: ¿A dónde envío el JSON limpio?
-# Mapea el número receptor (tu tarjeta/celular) con la URL del siguiente servicio.
-# Ejemplo: {"5350000000": "https://api.tu-otro-servicio.com/procesar-juan"}
+# 2. ENRUTAMIENTO NORMAL: mapea número receptor -> URL destino
 try:
     routes_env = os.environ.get("CLIENT_ROUTES", "{}")
     CLIENT_ROUTES = json.loads(routes_env)
 except json.JSONDecodeError:
     print("⚠️ Error: CLIENT_ROUTES mal formado. No se podrá reenviar.")
     CLIENT_ROUTES = {}
+
+# 3. RUTA DE DEPURACIÓN (opcional): todos los mensajes no ruteables se envían aquí
+DEBUG_ROUTE = os.environ.get("DEBUG_ROUTE")  # Ej: "https://mi-servidor.com/debug"
 
 # ==============================================================================
 # 1. MOTORES DE PARSEO (CEREBRO)
@@ -96,7 +96,7 @@ def sms_gateway(token):
         return jsonify({"status": "error", "msg": "Unauthorized"}), 401
 
     cliente_origen = VALID_TOKENS[token]
-    print(f"✅ SMS de: {cliente_origen}")
+    print(f"✅ SMS de: {cliente_origen} (token: {token})")
 
     # --- 📥 2. RECIBIR DATA ---
     try:
@@ -106,70 +106,78 @@ def sms_gateway(token):
         
         sms_text = req.get("text") or req.get("body") or req.get("message") or ""
         sender_origin = req.get("dirección", "") or req.get("sender", "") or ""
-        # El número que recibió el SMS (útil si Deku lo envía, sino usamos default)
         my_receiver_number = req.get("my_number", "NUMERO_DESCONOCIDO")
 
-        print(f"📨 RAW: {sms_text[:50]}...")
+        print(f"📨 RAW (primeros 100 chars): {sms_text[:100]}...")
+        print(f"📞 Remitente original: {sender_origin}")
+        print(f"📲 Número receptor propio: {my_receiver_number}")
 
         # --- 🧠 3. PARSEO ---
         parsed_data = {}
         
-        # Detectar tipo de mensaje
+        # Detectar tipo de mensaje basado en el remitente original o el texto
         if "PAGO" in sender_origin.upper() or "TRANSFER" in sms_text.upper():
             parsed_data = parse_transfermovil(sms_text)
         elif "CUBACEL" in sender_origin.upper() or "CUBACEL" in sms_text.upper():
             parsed_data = parse_cubacel(sms_text)
             parsed_data["receptor"] = my_receiver_number # Cubacel no dice a quién se lo enviaste (es a ti mismo)
-        
-        # Si no se pudo leer, ignoramos
-        if not parsed_data.get("valid"):
-            print("⚠️ SMS ignorado (No coincide con patrones).")
-            return jsonify({"status": "ignored"}), 200
+        else:
+            # Si no se pudo determinar el proveedor, creamos un objeto mínimo
+            parsed_data = {
+                "proveedor": "DESCONOCIDO",
+                "valid": False,
+                "raw": sms_text
+            }
 
-        # --- 🔀 4. RESOLUCIÓN DE DESTINO (ROUTING) ---
-        receptor_final = parsed_data.get("receptor")
+        # --- 🔀 4. RESOLUCIÓN DE DESTINO ---
+        destination_url = None
+        receptor_final = parsed_data.get("receptor") if isinstance(parsed_data, dict) else None
 
-        # Caso especial: Monedero no dice el número de cuenta en el SMS a veces
-        if receptor_final == "MONEDERO_DETECTADO":
-            # Aquí podrías asignar uno por defecto o buscar en CLIENT_ROUTES si tienes lógica extra
-            # Por ahora lo dejaremos pasar tal cual
-            pass
+        # Si el parseo fue válido y tenemos receptor, intentamos enrutamiento normal
+        if parsed_data.get("valid") and receptor_final:
+            # Buscar coincidencia exacta
+            destination_url = CLIENT_ROUTES.get(str(receptor_final))
+            # Si no, buscar coincidencia parcial
+            if not destination_url:
+                for key_account, url in CLIENT_ROUTES.items():
+                    if key_account in str(receptor_final):
+                        destination_url = url
+                        parsed_data["receptor_normalizado"] = key_account
+                        break
 
-        # Buscar a qué URL enviar este JSON
-        destination_url = CLIENT_ROUTES.get(str(receptor_final))
-
-        # Si no hay match exacto, buscar parcial (útil para tarjetas que cambian o claves largas)
-        if not destination_url:
-            for key_account, url in CLIENT_ROUTES.items():
-                if key_account in str(receptor_final):
-                    destination_url = url
-                    parsed_data["receptor_normalizado"] = key_account
-                    break
-        
-        if not destination_url:
-            print(f"❌ Error: No tengo a dónde enviar datos de la cuenta {receptor_final}")
-            # Guardamos el log pero respondemos 200 a Deku para que no reintente
-            return jsonify({"status": "error", "msg": "No route for receiver"}), 200
-
-        # --- 🚀 5. REENVÍO AL SIGUIENTE SERVICIO ---
+        # --- 🚀 5. REENVÍO (normal o a depuración) ---
         payload_forward = {
             "source": "sms_parser",
             "timestamp": datetime.now().isoformat(),
             "origin_device": cliente_origen,
+            "token": token,  # útil para depuración
+            "sender_original": sender_origin,
+            "my_receiver_number": my_receiver_number,
             "data": parsed_data
         }
 
-        print(f"🚀 Reenviando a {destination_url}...")
-        
-        # Enviamos y olvidamos (Fire and forget) o esperamos respuesta rápida
-        try:
-            requests.post(destination_url, json=payload_forward, timeout=5)
-            print("✅ JSON enviado exitosamente.")
-        except Exception as e:
-            print(f"⚠️ Falló el reenvío al servicio final: {e}")
+        # Si tenemos destino normal, enviamos allí
+        if destination_url:
+            print(f"🚀 Reenviando a destino normal: {destination_url}")
+            try:
+                requests.post(destination_url, json=payload_forward, timeout=5)
+                print("✅ JSON enviado exitosamente a destino normal.")
+            except Exception as e:
+                print(f"⚠️ Falló el reenvío al destino normal: {e}")
+        else:
+            # No hay ruta normal: si DEBUG_ROUTE está configurada, enviamos a depuración
+            if DEBUG_ROUTE:
+                print(f"🔍 No hay ruta normal. Enviando a depuración: {DEBUG_ROUTE}")
+                try:
+                    requests.post(DEBUG_ROUTE, json=payload_forward, timeout=5)
+                    print("✅ JSON enviado a depuración.")
+                except Exception as e:
+                    print(f"⚠️ Falló el envío a depuración: {e}")
+            else:
+                print("ℹ️ No hay ruta normal ni DEBUG_ROUTE. Mensaje no reenviado.")
 
-        # Respondemos a Deku que todo salió bien (ya nosotros tenemos la data)
-        return jsonify({"status": "success", "parsed": True}), 200
+        # Respondemos siempre 200 a Deku para que no reintente
+        return jsonify({"status": "success", "parsed": parsed_data.get("valid", False)}), 200
 
     except Exception as e:
         print(f"🔥 CRITICAL ERROR: {e}")
