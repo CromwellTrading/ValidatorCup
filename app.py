@@ -31,7 +31,7 @@ except json.JSONDecodeError:
 DEBUG_ROUTE = os.environ.get("DEBUG_ROUTE")  # Ej: "https://mi-servidor.com/debug"
 
 # ==============================================================================
-# 1. MOTORES DE PARSEO (CEREBRO)
+# 1. MOTORES DE PARSEO
 # ==============================================================================
 
 def parse_transfermovil(text):
@@ -43,7 +43,6 @@ def parse_transfermovil(text):
         "valid": False, "raw": text
     }
     
-    # Intento 1: Pago Identificado (Titular a cuenta)
     regex_full = r"titular del tel[eé]fono\s+(\d+).*transferencia\s+(?:a la cuenta|al Monedero MiTransfer)\s+([\dX]+)\s+de\s+([\d.]+)\s+CUP.*Nro. Transaccion\s+([A-Z0-9]+)"
     match_full = re.search(regex_full, text, re.IGNORECASE | re.DOTALL)
 
@@ -56,14 +55,13 @@ def parse_transfermovil(text):
         data["valid"] = True
         return data
 
-    # Intento 2: Pago Monedero (A veces llega sin remitente claro en algunas versiones)
     if "Monedero MiTransfer" in text:
         match_monto = re.search(r"(?:con:|de)\s*([\d\.]+)\s*CUP", text)
         match_id = re.search(r"(?:Id|Nro\.)\s*Transaccion[:\s]+([A-Z0-9]+)", text, re.IGNORECASE)
         
         if match_monto and match_id:
             data["remitente"] = "ANONIMO"
-            data["receptor"] = "MONEDERO_DETECTADO" # Se resolverá después
+            data["receptor"] = "MONEDERO_DETECTADO"
             data["monto"] = float(match_monto.group(1))
             data["transaccion_id"] = match_id.group(1)
             data["tipo_transaccion"] = "PAGO_ANONIMO"
@@ -98,17 +96,25 @@ def sms_gateway(token):
     cliente_origen = VALID_TOKENS[token]
     print(f"✅ SMS de: {cliente_origen} (token: {token})")
 
-    # --- 📥 2. RECIBIR DATA ---
+    # --- 📥 2. RECIBIR DATA Y MOSTRARLA COMPLETA EN LOG ---
     try:
         req = request.get_json(force=True, silent=True)
         if not req:
+            print("❌ No se recibió JSON válido")
             return jsonify({"status": "error", "msg": "No JSON"}), 400
-        
+
+        # Mostrar el JSON completo recibido (para ver la estructura que envía Deku)
+        print("📦 JSON recibido completo:")
+        print(json.dumps(req, indent=2, ensure_ascii=False))
+
+        # Extraer campos relevantes
         sms_text = req.get("text") or req.get("body") or req.get("message") or ""
         sender_origin = req.get("dirección", "") or req.get("sender", "") or ""
         my_receiver_number = req.get("my_number", "NUMERO_DESCONOCIDO")
 
-        print(f"📨 RAW (primeros 100 chars): {sms_text[:100]}...")
+        # Mostrar el texto completo del SMS
+        print(f"📨 TEXTO COMPLETO DEL SMS ({len(sms_text)} caracteres):")
+        print(sms_text)
         print(f"📞 Remitente original: {sender_origin}")
         print(f"📲 Número receptor propio: {my_receiver_number}")
 
@@ -120,7 +126,8 @@ def sms_gateway(token):
             parsed_data = parse_transfermovil(sms_text)
         elif "CUBACEL" in sender_origin.upper() or "CUBACEL" in sms_text.upper():
             parsed_data = parse_cubacel(sms_text)
-            parsed_data["receptor"] = my_receiver_number # Cubacel no dice a quién se lo enviaste (es a ti mismo)
+            if parsed_data.get("valid"):
+                parsed_data["receptor"] = my_receiver_number
         else:
             # Si no se pudo determinar el proveedor, creamos un objeto mínimo
             parsed_data = {
@@ -129,15 +136,14 @@ def sms_gateway(token):
                 "raw": sms_text
             }
 
+        print(f"🔍 Resultado del parseo: {parsed_data.get('proveedor')} - válido: {parsed_data.get('valid')}")
+
         # --- 🔀 4. RESOLUCIÓN DE DESTINO ---
         destination_url = None
         receptor_final = parsed_data.get("receptor") if isinstance(parsed_data, dict) else None
 
-        # Si el parseo fue válido y tenemos receptor, intentamos enrutamiento normal
         if parsed_data.get("valid") and receptor_final:
-            # Buscar coincidencia exacta
             destination_url = CLIENT_ROUTES.get(str(receptor_final))
-            # Si no, buscar coincidencia parcial
             if not destination_url:
                 for key_account, url in CLIENT_ROUTES.items():
                     if key_account in str(receptor_final):
@@ -150,13 +156,12 @@ def sms_gateway(token):
             "source": "sms_parser",
             "timestamp": datetime.now().isoformat(),
             "origin_device": cliente_origen,
-            "token": token,  # útil para depuración
+            "token": token,
             "sender_original": sender_origin,
             "my_receiver_number": my_receiver_number,
             "data": parsed_data
         }
 
-        # Si tenemos destino normal, enviamos allí
         if destination_url:
             print(f"🚀 Reenviando a destino normal: {destination_url}")
             try:
@@ -174,7 +179,7 @@ def sms_gateway(token):
                 except Exception as e:
                     print(f"⚠️ Falló el envío a depuración: {e}")
             else:
-                print("ℹ️ No hay ruta normal ni DEBUG_ROUTE. Mensaje no reenviado.")
+                print("ℹ️ No hay ruta normal ni DEBUG_ROUTE. Mensaje no reenviado (solo se ha logueado).")
 
         # Respondemos siempre 200 a Deku para que no reintente
         return jsonify({"status": "success", "parsed": parsed_data.get("valid", False)}), 200
